@@ -8,7 +8,7 @@ CHECK_CURL := $(shell command -v curl 2> /dev/null)
 CHECK_WGET := $(shell command -v wget 2> /dev/null)
 
 ifdef CHECK_CURL
-DOWNLOAD_CMD = curl -o
+DOWNLOAD_CMD = curl -OL
 else ifdef CHECK_WGET
 DOWNLOAD_CMD = wget -O
 else
@@ -37,7 +37,7 @@ install-deps:
 	# Use OS variable in the download URL and unzip command
 	$(DOWNLOAD_CMD) https://github.com/protocolbuffers/protobuf/releases/download/v3.16.3/protoc-3.16.3-$(OS)-x86_64.zip
 	unzip protoc-3.16.3-$(OS)-x86_64.zip -d ./protoc
-
+	rm protoc-3.16.3-$(OS)-x86_64.zip
 
 postgres:
 	docker run --name postgres -e POSTGRES_PASSWORD=wow -e POSTGRES_DB=blockchain -p 5432:5432 -d postgres:14
