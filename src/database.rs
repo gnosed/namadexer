@@ -1,15 +1,23 @@
 use crate::{config::DatabaseConfig, error::Error, utils};
+
 use borsh::de::BorshDeserialize;
 
 use namada::proto;
+use namada::types::transaction::governance::VoteProposalData;
 use namada::types::{
     address::Address,
     eth_bridge_pool::PendingTransfer,
     key::common::PublicKey,
     token,
-    transaction::{self, account::UpdateAccount, pgf::UpdateStewardCommission, TxType},
+    transaction::{
+        self,
+        account::{InitAccount, UpdateAccount},
+        pgf::UpdateStewardCommission,
+        TxType,
+    },
 };
 use sqlx::postgres::{PgPool, PgPoolOptions, PgRow as Row};
+use sqlx::Row as TRow;
 use sqlx::{query, QueryBuilder, Transaction};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -26,10 +34,12 @@ use crate::{
 };
 
 use crate::tables::{
+    get_create_account_public_keys_table, get_create_account_updates_table,
     get_create_block_table_query, get_create_commit_signatures_table_query,
-    get_create_evidences_table_query, get_create_transactions_table_query,
-    get_create_tx_bond_table_query, get_create_tx_bridge_pool_table_query,
-    get_create_tx_transfer_table_query,
+    get_create_delegations_table, get_create_evidences_table_query,
+    get_create_transactions_table_query, get_create_tx_bond_table_query,
+    get_create_tx_bridge_pool_table_query, get_create_tx_transfer_table_query,
+    get_create_vote_proposal_table,
 };
 
 use metrics::{histogram, increment_counter};
@@ -94,9 +104,9 @@ impl Database {
     /// - `evidences` Where block's evidence data is stored.
     #[instrument(skip(self))]
     pub async fn create_tables(&self) -> Result<(), Error> {
-        info!("Creating tables if doesn't exist");
+        info!("Creating tables if they don't exist");
 
-        query(format!("CREATE SCHEMA IF NOT EXISTS {}", self.network).as_str())
+        query(&format!("CREATE SCHEMA IF NOT EXISTS {}", self.network))
             .execute(&*self.pool)
             .await?;
 
@@ -125,6 +135,22 @@ impl Database {
             .await?;
 
         query(get_create_tx_bridge_pool_table_query(&self.network).as_str())
+            .execute(&*self.pool)
+            .await?;
+
+        query(get_create_account_updates_table(&self.network).as_str())
+            .execute(&*self.pool)
+            .await?;
+
+        query(get_create_account_public_keys_table(&self.network).as_str())
+            .execute(&*self.pool)
+            .await?;
+
+        query(get_create_vote_proposal_table(&self.network).as_str())
+            .execute(&*self.pool)
+            .await?;
+
+        query(get_create_delegations_table(&self.network).as_str())
             .execute(&*self.pool)
             .await?;
 
@@ -254,6 +280,7 @@ impl Database {
         Self::save_transactions(
             block.data.as_ref(),
             &block_id,
+            block.header.height.value(),
             checksums_map,
             sqlx_tx,
             network,
@@ -307,7 +334,7 @@ impl Database {
     }
 
     /// Save a block and commit database
-    #[instrument(skip(block_id, signatures))]
+    #[instrument(skip(block_id, signatures, sqlx_tx, network))]
     pub async fn save_commit_sinatures<'a>(
         block_id: &[u8],
         signatures: &Vec<CommitSig>,
@@ -417,7 +444,7 @@ impl Database {
     /// Save all the evidences in the list, it is up to the caller to
     /// call sqlx_tx.commit().await?; for the changes to take place in
     /// database.
-    #[instrument(skip(evidences, block_id, sqlx_tx))]
+    #[instrument(skip(evidences, block_id, sqlx_tx, network))]
     async fn save_evidences<'a>(
         evidences: RawEvidenceList,
         block_id: &[u8],
@@ -523,10 +550,11 @@ impl Database {
     /// Save all the transactions in txs, it is up to the caller to
     /// call sqlx_tx.commit().await?; for the changes to take place in
     /// database.
-    #[instrument(skip(txs, block_id, sqlx_tx, checksums_map))]
+    #[instrument(skip(txs, block_id, sqlx_tx, checksums_map, block_height, network))]
     async fn save_transactions<'a>(
         txs: &Vec<Vec<u8>>,
         block_id: &[u8],
+        block_height: u64,
         checksums_map: &HashMap<String, String>,
         sqlx_tx: &mut Transaction<'a, sqlx::Postgres>,
         network: &str,
@@ -548,11 +576,13 @@ impl Database {
         }
 
         info!(message = "Saving transactions");
+
         let mut query_builder: QueryBuilder<_> = QueryBuilder::new(format!(
             "INSERT INTO {}.transactions(
                     hash, 
                     block_id, 
                     tx_type,
+                    wrapper_id,
                     fee_amount_per_gas_unit,
                     fee_token,
                     gas_limit_multiplier,
@@ -570,12 +600,26 @@ impl Database {
         // being 8 the number of columns.
         let mut tx_values = Vec::with_capacity(txs.len());
 
+        let mut i: usize = 0;
         for t in txs.iter() {
             let tx = proto::Tx::try_from(t.as_slice()).map_err(|_| Error::InvalidTxData)?;
             let mut code = Default::default();
+            let mut txid_wrapper: Vec<u8> = vec![];
+
+            let mut hash_id = tx.header_hash().to_vec();
 
             // Decrypted transaction give access to the raw data
             if let TxType::Decrypted(..) = tx.header().tx_type {
+                // look for wrapper tx to link to
+                let txs = query(&format!("SELECT * FROM {0}.transactions WHERE block_id IN (SELECT block_id FROM {0}.blocks WHERE header_height = {1});", network, block_height-1))
+                    .fetch_all(&mut *sqlx_tx)
+                    .await?;
+                txid_wrapper = txs[i].try_get("hash")?;
+                i += 1;
+
+                // For unknown reason the header has to be updated before hashing it for its id (https://github.com/Zondax/namadexer/issues/23)
+                hash_id = tx.clone().update_header(TxType::Raw).header_hash().to_vec();
+
                 code = tx
                     .get_section(tx.code_sechash())
                     .and_then(|s| s.code_sec())
@@ -588,10 +632,11 @@ impl Database {
                 let type_tx = checksums_map.get(&code_hex).unwrap_or(&unknown_type);
                 let data = tx.data().ok_or(Error::InvalidTxData)?;
 
+                info!("Saving {} transaction", type_tx);
+
                 // decode tx_transfer, tx_bond and tx_unbound to store the decoded data in their tables
                 match type_tx.as_str() {
                     "tx_transfer" => {
-                        info!("Saving tx_transfer");
                         let transfer = token::Transfer::try_from_slice(&data[..])?;
 
                         let mut query_builder: QueryBuilder<_> = QueryBuilder::new(format!(
@@ -609,7 +654,7 @@ impl Database {
 
                         let query = query_builder
                             .push_values(std::iter::once(0), |mut b, _| {
-                                b.push_bind(tx.header_hash().0.as_slice().to_vec())
+                                b.push_bind(&hash_id)
                                     .push_bind(transfer.source.to_string())
                                     .push_bind(transfer.target.to_string())
                                     .push_bind(transfer.token.to_string())
@@ -621,7 +666,6 @@ impl Database {
                         query.execute(&mut *sqlx_tx).await?;
                     }
                     "tx_bond" => {
-                        info!("Saving tx_bond");
                         let bond = transaction::pos::Bond::try_from_slice(&data[..])?;
 
                         let mut query_builder: QueryBuilder<_> = QueryBuilder::new(format!(
@@ -637,7 +681,7 @@ impl Database {
 
                         let query = query_builder
                             .push_values(std::iter::once(0), |mut b, _| {
-                                b.push_bind(tx.header_hash().0.as_slice().to_vec())
+                                b.push_bind(&hash_id)
                                     .push_bind(bond.validator.to_string())
                                     .push_bind(bond.amount.to_string_native())
                                     .push_bind(bond.source.as_ref().map(|s| s.to_string()))
@@ -647,7 +691,6 @@ impl Database {
                         query.execute(&mut *sqlx_tx).await?;
                     }
                     "tx_unbond" => {
-                        info!("Saving tx_unbond");
                         let unbond = transaction::pos::Unbond::try_from_slice(&data[..])?;
 
                         let mut query_builder: QueryBuilder<_> = QueryBuilder::new(format!(
@@ -663,7 +706,7 @@ impl Database {
 
                         let query = query_builder
                             .push_values(std::iter::once(0), |mut b, _| {
-                                b.push_bind(tx.header_hash().0.as_slice().to_vec())
+                                b.push_bind(&hash_id)
                                     .push_bind(unbond.validator.to_string())
                                     .push_bind(unbond.amount.to_string_native())
                                     .push_bind(
@@ -679,7 +722,6 @@ impl Database {
                     }
                     // this is an ethereum transaction
                     "tx_bridge_pool" => {
-                        info!("Saving tx_bridge_pool");
                         // Only TransferToEthereum type is supported at the moment by namada and us.
                         let tx_bridge = PendingTransfer::try_from_slice(&data[..])?;
 
@@ -698,7 +740,7 @@ impl Database {
 
                         let query = query_builder
                             .push_values(std::iter::once(0), |mut b, _| {
-                                b.push_bind(tx.header_hash().0.as_slice().to_vec())
+                                b.push_bind(&hash_id)
                                     .push_bind(tx_bridge.transfer.asset.to_string())
                                     .push_bind(tx_bridge.transfer.recipient.to_string())
                                     .push_bind(tx_bridge.transfer.sender.to_string())
@@ -710,11 +752,58 @@ impl Database {
                             .build();
                         query.execute(&mut *sqlx_tx).await?;
                     }
+                    "tx_vote_proposal" => {
+                        let mut query_builder: QueryBuilder<_> = QueryBuilder::new(format!(
+                            "INSERT INTO {}.vote_proposal(
+                                vote_proposal_id,
+                                vote,
+                                vote_default,
+                                voter,
+                                tx_id
+                            )",
+                            network
+                        ));
+
+                        let tx_data = VoteProposalData::try_from_slice(&data[..])?;
+
+                        // vote_proposal_id is an u64, due to lack of support for unsigned
+                        // integers, we store it as be bytes.
+                        let proposal_id = tx_data.id.to_be_bytes();
+
+                        let query = query_builder
+                            .push_values(std::iter::once(0), |mut b, _| {
+                                b.push_bind(proposal_id)
+                                    .push_bind(tx_data.vote.is_yay())
+                                    .push_bind(tx_data.vote.is_default_vote())
+                                    .push_bind(tx_data.voter.encode())
+                                    .push_bind(&hash_id);
+                            })
+                            .build();
+                        query.execute(&mut *sqlx_tx).await?;
+
+                        // now store delegators
+                        let mut query_builder: QueryBuilder<_> = QueryBuilder::new(format!(
+                            "INSERT INTO {}.delegations(
+                                vote_proposal_id,
+                                delegator_id
+                            )",
+                            network
+                        ));
+
+                        // Insert each key which would have an update_id associated to it,
+                        // allowing querying keys per updates.
+                        // this also does batch insertion
+                        let query = query_builder
+                            .push_values(tx_data.delegations.iter(), |mut b, key| {
+                                b.push_bind(proposal_id).push_bind(key.encode());
+                            })
+                            .build();
+                        query.execute(&mut *sqlx_tx).await?;
+                    }
                     "tx_reveal_pk" => {
                         // nothing to do here, only check that data is a valid publicKey
                         // otherwise this transaction must not make it into
                         // the database.
-                        info!("Saving tx_reveal_pk");
                         _ = PublicKey::try_from_slice(&data[..])?;
                     }
                     "tx_resign_steward" => {
@@ -725,18 +814,51 @@ impl Database {
                     "tx_update_steward_commission" => {
                         // Not much to do, just, check that the address this transactions
                         // holds in the data field is correct, or at least parsed succesfully.
-                        // TODO: We might need to create a new table for this?
-                        // so we can tell what account have changed and how?
                         _ = UpdateStewardCommission::try_from_slice(&data[..])?;
+                    }
+                    "tx_init_account" => {
+                        // check that transaction can be parsed
+                        // before inserting it into database.
+                        // later accounts could be updated using
+                        // tx_update_account, however there is not way
+                        // so far to link those transactions to this.
+                        _ = InitAccount::try_from_slice(&data[..])?;
                     }
                     "tx_update_account" => {
                         // check that transaction can be parsed
                         // before storing it into database
-                        // TODO: Later we might need to create a table
-                        // for this . This would allow us
-                        // to track down what accounts have been updated
-                        // and how.
-                        _ = UpdateAccount::try_from_slice(&data[..])?;
+                        let tx = UpdateAccount::try_from_slice(&data[..])?;
+
+                        let insert_query = format!(
+                            "INSERT INTO {}.account_updates(account_id, vp_code_hash, threshold, tx_id) 
+                                VALUES ($1, $2, $3, $4) RETURNING update_id",
+                            network
+                        );
+
+                        let update_id: i32 = sqlx::query_scalar(&insert_query)
+                            .bind(tx.addr.encode())
+                            .bind(tx.vp_code_hash.map(|hash| hash.0))
+                            .bind(tx.threshold.map(|t| t as i32))
+                            .bind(&hash_id)
+                            .fetch_one(&mut *sqlx_tx)
+                            .await?;
+
+                        let mut query_builder: QueryBuilder<_> = QueryBuilder::new(format!(
+                            "INSERT INTO {}.account_public_keys(
+                                update_id,
+                                public_key
+                            )",
+                            network
+                        ));
+
+                        // Insert each key which would have an update_id associated to it,
+                        // allowing querying keys per updates.
+                        let query = query_builder
+                            .push_values(tx.public_keys.iter(), |mut b, key| {
+                                b.push_bind(update_id).push_bind(key.to_string());
+                            })
+                            .build();
+                        query.execute(&mut *sqlx_tx).await?;
                     }
                     _ => {}
                 }
@@ -754,9 +876,10 @@ impl Database {
             }
 
             tx_values.push((
-                tx.header_hash().0.as_slice().to_vec(),
+                hash_id,
                 block_id.to_vec(),
                 utils::tx_type_name(&tx.header.tx_type),
+                txid_wrapper,
                 fee_amount_per_gas_unit,
                 fee_token,
                 gas_limit_multiplier,
@@ -779,6 +902,7 @@ impl Database {
                     hash,
                     block_id,
                     tx_type,
+                    wrapper_id,
                     fee_amount_per_gas_unit,
                     fee_token,
                     fee_gas_limit_multiplier,
@@ -788,6 +912,7 @@ impl Database {
                     b.push_bind(hash)
                         .push_bind(block_id)
                         .push_bind(tx_type)
+                        .push_bind(wrapper_id)
                         .push_bind(fee_amount_per_gas_unit)
                         .push_bind(fee_token)
                         .push_bind(fee_gas_limit_multiplier as i64)
@@ -957,6 +1082,26 @@ impl Database {
         .execute(&*self.pool)
         .await?;
 
+        query(
+            format!(
+                "ALTER TABLE {}.account_public_keys ADD CONSTRAINT pk_id PRIMARY KEY (id);",
+                self.network
+            )
+            .as_str(),
+        )
+        .execute(&*self.pool)
+        .await?;
+
+        query(
+            format!(
+                "ALTER TABLE {}.delegations ADD CONSTRAINT del_id PRIMARY KEY (id);",
+                self.network
+            )
+            .as_str(),
+        )
+        .execute(&*self.pool)
+        .await?;
+
         Ok(())
     }
 
@@ -1035,7 +1180,7 @@ impl Database {
     /// Returns all the tx hashes for a block
     pub async fn get_tx_hashes_block(&self, hash: &[u8]) -> Result<Vec<Row>, Error> {
         // query for all tx hash that are in a block identified by the block_id
-        let str = format!("SELECT t.hash FROM {0}.{BLOCKS_TABLE_NAME} b JOIN {0}.{TX_TABLE_NAME} t ON b.block_id = t.block_id WHERE b.block_id =$1;", self.network);
+        let str = format!("SELECT t.hash, t.tx_type FROM {0}.{BLOCKS_TABLE_NAME} b JOIN {0}.{TX_TABLE_NAME} t ON b.block_id = t.block_id WHERE b.block_id = $1;", self.network);
 
         query(&str)
             .bind(hash)
@@ -1068,6 +1213,197 @@ impl Database {
 
         query(&str)
             .fetch_all(&*self.pool)
+            .await
+            .map_err(Error::from)
+    }
+
+    /// Retrieves a historical list of thresholds associated with a given account.
+    ///
+    /// This function executes a SQL query to aggregate thresholds (`ARRAY_AGG`) for the specified
+    /// `account_id`. The thresholds are ordered by `update_id`, which serves as a chronological marker,
+    /// indicating the sequence of updates. The most recent threshold is at the end of the list.
+    ///
+    /// # Parameters
+    ///
+    /// - `account_id`: A string slice (`&str`) representing the unique identifier of the account.
+    ///
+    /// # Returns
+    ///
+    /// - On success, returns an `Option<Row>`. The `Row` contains an aggregated list
+    ///   of thresholds (aliased as `thresholds`) for the account. If the account does not exist,
+    ///   returns `Ok(None)`.
+    /// - On failure, returns an `Error`.
+    ///
+    /// # Usage
+    ///
+    /// This function is useful for tracking the evolution of thresholds associated with an account over time.
+    /// It provides a comprehensive history, allowing users or systems to understand how the thresholds
+    /// associated with the account have changed and to identify the current threshold in use.
+    pub async fn account_thresholds(&self, account_id: &str) -> Result<Option<Row>, Error> {
+        let to_query = r#"
+            SELECT ARRAY_AGG(threshold ORDER BY update_id ASC) AS thresholds
+            FROM account_updates
+            WHERE account_id = $1
+            GROUP BY account_id;
+        "#;
+
+        query(to_query)
+            .bind(account_id)
+            .fetch_optional(&*self.pool)
+            .await
+            .map_err(Error::from)
+    }
+
+    /// Retrieves a historical list of vp_code_hashes associated with a given account.
+    ///
+    /// This function executes a SQL query to aggregate vp_code_hashes (`ARRAY_AGG`) for the specified
+    /// `account_id`. The hashes are ordered by `update_id`, which serves as a chronological marker,
+    /// indicating the sequence of updates. The most recent hash is at the end of the list.
+    ///
+    /// # Parameters
+    ///
+    /// - `account_id`: A string slice (`&str`) representing the unique identifier of the account.
+    ///
+    /// # Returns
+    ///
+    /// - On success, returns an `Option<Row>`. The `Row` contains an aggregated list
+    ///   of vp_code_hashes (aliased as `code_hashes`) for the account. If the account does not exist,
+    ///   returns `Ok(None)`.
+    /// - On failure, returns an `Error`.
+    ///
+    /// # Usage
+    ///
+    /// This function is useful for tracking the evolution of vp_code_hashes associated with an account over time.
+    /// It provides a comprehensive history, allowing users or systems to understand how the vp_code_hashes
+    /// associated with the account have changed and to identify the current vp_code_hash in use.
+    pub async fn account_vp_codes(&self, account_id: &str) -> Result<Option<Row>, Error> {
+        let to_query = r#"
+            SELECT ARRAY_AGG(vp_code_hash ORDER BY update_id ASC) AS code_hashes
+            FROM account_updates
+            WHERE account_id = $1
+            GROUP BY account_id;
+        "#;
+
+        query(to_query)
+            .bind(account_id)
+            .fetch_optional(&*self.pool)
+            .await
+            .map_err(Error::from)
+    }
+
+    /// Retrieves a historical list of public key sets associated with a given account.
+    ///
+    /// This function executes a SQL query to aggregate public keys (`ARRAY_AGG`) for each `update_id`
+    /// associated with the specified `account_id`. The keys within each batch are ordered by their `id`.
+    /// The `update_id` serves as a chronological marker, indicating when each set of public keys was
+    /// associated with the account. The most recent set is at the end of the list.
+    ///
+    /// # Parameters
+    ///
+    /// - `account_id`: A string slice (`&str`) representing the unique identifier of the account.
+    ///
+    /// # Returns
+    /// - On success, returns a vector of `Row` instances. Each `Row` contains an aggregated list
+    ///   of public keys (aliased as `public_keys_batch`) for a particular update of the account.
+    /// - An `Error` on failure
+    ///
+    /// # Details
+    ///
+    /// - The function groups (`GROUP BY`) the public keys based on the `update_id` and orders (`ORDER BY`)
+    ///   the overall result set in ascending order of `update_id`.
+    /// - Each `Row` in the returned vector represents a different update to the account, containing a
+    ///   batch of public keys. These batches are ordered chronologically, with the last element in the
+    ///   vector representing the most recent set of public keys associated with the account.
+    ///
+    /// # Usage
+    ///
+    /// This function is useful for tracking the evolution of public keys associated with an account over time.
+    /// It provides a comprehensive history, allowing users or systems to understand how the account's
+    /// public keys have changed and to identify the current set of public keys.
+    pub async fn account_public_keys(&self, account_id: &str) -> Result<Vec<Row>, Error> {
+        let to_query = r#"
+            SELECT ARRAY_AGG(public_key ORDER BY id ASC) as public_keys_batch
+            FROM account_public_keys 
+            WHERE update_id IN (
+                SELECT update_id FROM account_updates WHERE account_id = $1
+            )
+            GROUP BY update_id
+            ORDER BY update_id ASC;
+        "#;
+
+        // Each returned row would contain a vector of public keys formatted as strings.
+        // The column's name is publick_key_batch.
+        query(to_query)
+            .bind(account_id)
+            .fetch_all(&*self.pool)
+            .await
+            .map_err(Error::from)
+    }
+
+    pub async fn vote_proposal_data(&self, proposal_id: u64) -> Result<Option<Row>, Error> {
+        let query = format!(
+            "SELECT * FROM {}.vote_proposal WHERE vote_proposal_id = $1",
+            self.network
+        );
+
+        // Execute the query and fetch the first row (if any)
+        let result = sqlx::query(&query)
+            .bind(proposal_id.to_be_bytes())
+            .fetch_optional(&*self.pool)
+            .await?;
+
+        Ok(result)
+    }
+
+    pub async fn vote_proposal_delegations(&self, proposal_id: u64) -> Result<Vec<Row>, Error> {
+        let q = format!(
+            "SELECT delegator_id 
+                FROM {}.delegations 
+                WHERE vote_proposal_id = $1",
+            self.network
+        );
+
+        query(&q)
+            .bind(proposal_id.to_be_bytes())
+            .fetch_all(&*self.pool)
+            .await
+            .map_err(Error::from)
+    }
+
+    // Return the number of commits signed by the `validator_address` in a range of 500 blocks.
+    // It is use to calculate the validator uptime.
+    pub async fn validator_uptime(
+        &self,
+        validator_address: &[u8],
+        start: Option<&i32>,
+        end: Option<&i32>,
+    ) -> Result<Row, Error> {
+        // if no parameters defined we return result on the last 500 blocks
+        let mut q = format!(
+            "SELECT COUNT(*)
+                FROM {0}.commit_signatures
+                WHERE validator_address = $1
+                AND block_id IN
+                    (SELECT block_id FROM {0}.blocks WHERE header_height BETWEEN (SELECT MAX(header_height) FROM {0}.blocks) - 499 AND (SELECT MAX(header_height) FROM {0}.blocks))",
+            self.network,
+        );
+
+        if start.is_some() && end.is_some() {
+            q = format!(
+                "SELECT COUNT(*)
+                    FROM {0}.commit_signatures
+                    WHERE validator_address = $1
+                    AND block_id IN
+                        (SELECT block_id FROM {0}.blocks WHERE header_height BETWEEN ($2 + 1) AND $3)",
+                self.network,
+            );
+        }
+
+        query(&q)
+            .bind(validator_address)
+            .bind(start)
+            .bind(end)
+            .fetch_one(&*self.pool)
             .await
             .map_err(Error::from)
     }

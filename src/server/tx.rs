@@ -28,7 +28,7 @@ use sqlx::Row as TRow;
 // represents the number of columns
 // that db must contains in order to deserialized
 // transactions
-const NUM_TX_COLUMNS: usize = 8;
+const NUM_TX_COLUMNS: usize = 9;
 
 // namada::ibc::applications::transfer::msgs::transfer::TYPE_URL has been made private and can't be access anymore
 const MSG_TRANSFER_TYPE_URL: &str = "/ibc.applications.transfer.v1.MsgTransfer";
@@ -75,6 +75,9 @@ pub struct TxInfo {
     block_id: Vec<u8>,
     /// The transaction type encoded as a string
     tx_type: String,
+    /// id for the wrapper tx if the tx is decrypted. otherwise it is null.
+    #[serde(with = "hex::serde")]
+    wrapper_id: Vec<u8>,
     /// The transaction fee only for tx_type Wrapper (otherwise empty)
     fee_amount_per_gas_unit: String,
     fee_token: String,
@@ -187,6 +190,7 @@ impl TryFrom<Row> for TxInfo {
         let hash: Vec<u8> = row.try_get("hash")?;
         let block_id: Vec<u8> = row.try_get("block_id")?;
         let tx_type: String = row.try_get("tx_type")?;
+        let wrapper_id: Vec<u8> = row.try_get("wrapper_id")?;
         let fee_amount_per_gas_unit = row.try_get("fee_amount_per_gas_unit")?;
         let fee_token = row.try_get("fee_token")?;
         let gas_limit_multiplier = row.try_get("gas_limit_multiplier")?;
@@ -197,12 +201,50 @@ impl TryFrom<Row> for TxInfo {
             hash,
             block_id,
             tx_type,
+            wrapper_id,
             fee_amount_per_gas_unit,
             fee_token,
             gas_limit_multiplier,
             code,
             data,
             tx: None,
+        })
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct VoteProposalTx {
+    pub id: u64,
+    pub vote: bool,
+    pub is_default: bool,
+    pub voter: String,
+    pub delegations: Vec<String>,
+    #[serde(with = "hex::serde")]
+    pub tx_id: Vec<u8>,
+}
+
+impl TryFrom<Row> for VoteProposalTx {
+    type Error = Error;
+
+    fn try_from(value: Row) -> Result<Self, Self::Error> {
+        let id = value.try_get::<[u8; std::mem::size_of::<u64>()], _>("vote_proposal_id")?;
+        let id = u64::from_be_bytes(id);
+
+        let vote = value.try_get::<bool, _>("vote")?;
+        let is_default = value.try_get::<bool, _>("vote_default")?;
+        let voter = value.try_get::<String, _>("voter")?;
+        let tx_id = value.try_get::<Vec<u8>, _>("tx_id")?;
+
+        // empty this comes from another table.
+        let delegations = vec![];
+
+        Ok(Self {
+            id,
+            vote,
+            is_default,
+            voter,
+            delegations,
+            tx_id,
         })
     }
 }
