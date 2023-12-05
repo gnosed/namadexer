@@ -38,6 +38,7 @@ pub struct DatabaseConfig {
     pub user: String,
     pub password: String,
     pub dbname: String,
+    pub port: String,
     // The limit in seconds to wait for a ready database connection
     pub connection_timeout: Option<u64>,
 }
@@ -112,6 +113,7 @@ impl Default for DatabaseConfig {
             user: "postgres".to_owned(),
             password: "wow".to_owned(),
             dbname: "blockchain".to_owned(),
+            port: "5432".to_owned(),
             connection_timeout: None,
         }
     }

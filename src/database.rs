@@ -62,8 +62,8 @@ impl Database {
         // sqlx expects config of the form:
         // postgres://user:password@host/db_name
         let config = format!(
-            "postgres://{}:{}@{}/{}",
-            db_config.user, db_config.password, db_config.host, db_config.dbname
+            "postgres://{}:{}@{}:{}/{}",
+            db_config.user, db_config.password, db_config.host, db_config.port, db_config.dbname
         );
 
         // If timeout setting is not present in the provided configuration,
