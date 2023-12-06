@@ -19,6 +19,7 @@ pub const PROMETHEUS_HOST: &str = "localhost";
 pub const PROMETHEUS_PORT: u16 = 9000;
 
 pub const DEFAULT_NETWORK: &str = "public-testnet-14";
+pub const DEFAULT_DB_PORT: u16 = 5432;
 
 #[derive(Debug, Deserialize)]
 pub struct IndexerConfig {
@@ -38,7 +39,7 @@ pub struct DatabaseConfig {
     pub user: String,
     pub password: String,
     pub dbname: String,
-    pub port: String,
+    pub port: u16,
     // The limit in seconds to wait for a ready database connection
     pub connection_timeout: Option<u64>,
 }
@@ -113,7 +114,7 @@ impl Default for DatabaseConfig {
             user: "postgres".to_owned(),
             password: "wow".to_owned(),
             dbname: "blockchain".to_owned(),
-            port: "5432".to_owned(),
+            port: DEFAULT_DB_PORT,
             connection_timeout: None,
         }
     }
