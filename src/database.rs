@@ -1,20 +1,23 @@
 use crate::{config::DatabaseConfig, error::Error, utils};
 
-use borsh::de::BorshDeserialize;
-
-use namada::proto;
-use namada::types::transaction::governance::VoteProposalData;
-use namada::types::{
-    address::Address,
-    eth_bridge_pool::PendingTransfer,
-    key::common::PublicKey,
-    token,
-    transaction::{
-        self,
-        account::{InitAccount, UpdateAccount},
-        pgf::UpdateStewardCommission,
-        TxType,
+use namada_sdk::core::types::key::common::PublicKey;
+use namada_sdk::{
+    borsh::BorshDeserialize,
+    core::types::{
+        address::Address,
+        eth_bridge_pool::PendingTransfer,
+        // key::PublicKey,
+        token,
+        transaction::{
+            account::{InitAccount, UpdateAccount},
+            governance::VoteProposalData,
+            pgf::UpdateStewardCommission,
+            pos::{Bond, Unbond},
+            TxType,
+        },
     },
+    proto,
+    tendermint_proto::types::EvidenceList as RawEvidenceList,
 };
 use sqlx::postgres::{PgPool, PgPoolOptions, PgRow as Row};
 use sqlx::Row as TRow;
@@ -25,7 +28,6 @@ use std::time::Duration;
 use tendermint::block::Block;
 use tendermint_proto::types::evidence::Sum;
 use tendermint_proto::types::CommitSig;
-use tendermint_proto::types::EvidenceList as RawEvidenceList;
 use tendermint_rpc::endpoint::block_results;
 use tracing::{info, instrument, trace};
 
@@ -635,12 +637,19 @@ impl Database {
 
                 // Look for the reurn code associated to the tx
                 for event in end_events {
-                    // we assume it will always be in this order
-                    if event.attributes[5].key == "hash"
-                        && event.attributes[5].value.to_ascii_lowercase() == hex::encode(&hash_id)
-                    {
-                        // using unwrap here is ok because we assume it is always going to be a number unless there is a bug in the node
-                        return_code = Some(event.attributes[0].value.parse().unwrap());
+                    for attr in event.attributes.iter() {
+                        // We look to confirm hash of transaction
+                        if attr.key == "hash"
+                            && attr.value.to_ascii_lowercase() == hex::encode(&hash_id)
+                        {
+                            // Now we look for the return code
+                            for attr in event.attributes.iter() {
+                                if attr.key == "code" {
+                                    // using unwrap here is ok because we assume it is always going to be a number unless there is a bug in the node
+                                    return_code = Some(attr.value.parse().unwrap());
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -697,7 +706,7 @@ impl Database {
                         query.execute(&mut *sqlx_tx).await?;
                     }
                     "tx_bond" => {
-                        let bond = transaction::pos::Bond::try_from_slice(&data[..])?;
+                        let bond = Bond::try_from_slice(&data[..])?;
 
                         let mut query_builder: QueryBuilder<_> = QueryBuilder::new(format!(
                             "INSERT INTO {}.tx_bond(
@@ -722,7 +731,7 @@ impl Database {
                         query.execute(&mut *sqlx_tx).await?;
                     }
                     "tx_unbond" => {
-                        let unbond = transaction::pos::Unbond::try_from_slice(&data[..])?;
+                        let unbond = Unbond::try_from_slice(&data[..])?;
 
                         let mut query_builder: QueryBuilder<_> = QueryBuilder::new(format!(
                             "INSERT INTO {}.tx_bond(
